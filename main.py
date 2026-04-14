@@ -408,8 +408,10 @@
 #Вариант индивидуальный реализация модуля верификации маркера аутентификации (контроль подлинности маркера) для защиты от угрозы подмены субъекта сетевого доступа
 
 from sympy import symbols
+import os
 import time
 import hashlib
+import hmac
 import base64
 import json
 import pandas as  pd
@@ -420,6 +422,9 @@ matplotlib.rcParams['font.family'] = 'DejaVu Sans'
 
 #Время жизни маркера 10 минут (по умолчанию в DDS OAuth 2.0)
 TOKEN_TTL = 600
+
+# Секретный ключ для HMAC-подписи маркеров (компонент интеграции)
+TOKEN_SECRET_KEY = os.environ.get("TOKEN_SECRET_KEY", "")
 
 #КОНТЕЙНЕР РАСЧЁТА
 #Формулы для метрик маркера аутентификации
@@ -441,6 +446,10 @@ def generate_token(user_id, role, offset=0):
     }
     payload_json = json.dumps(payload, separators=("," ,":")).encode()
     payload_b64 = base64.urlsafe_b64encode(payload_json).decode().rstrip("=")
+     # Если ключ задан — HMAC-SHA256, иначе простой SHA-256
+    if TOKEN_SECRET_KEY:
+        signature = hmac.new(TOKEN_SECRET_KEY.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+    else:
     signature =  hashlib.sha256(payload_b64.encode()).hexdigest()
     return  f"{payload_b64}.{signature}", now
 
@@ -457,9 +466,12 @@ def verify_token(token):
 
     payload_b64, received_signature = parts[0], parts[1]
 
-    #Уровень 2: проверка целостности маркера (подпись SHA-256)
-    expected_signature = hashlib.sha256(payload_b64.encode()).hexdigest()
-    if expected_signature != received_signature:
+    #Уровень 2: проверка целостности маркера (подпись HMAC-SHA256 или SHA-256)
+    if TOKEN_SECRET_KEY:
+        expected_signature = hmac.new(TOKEN_SECRET_KEY.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
+    else:
+        expected_signature = hashlib.sha256(payload_b64.encode()).hexdigest()
+    if not hmac.compare_digest(expected_signature, received_signature):
         result["reason"] = "Подпись недействительна"
         return  result
 
@@ -540,63 +552,166 @@ print("access_lst:", access_lst)
 
 #КОНТЕЙНЕР ТАБЛИЧНОГО ВЫВОДА
 
-N = list(range(1,7))
-desc_lst = [s["desc"] for s in scenarios]
-table = list(zip(N, desc_lst, remaining_lst, pct_lst, result_lst, access_lst))
-df =  pd.DataFrame(
-      table, 
-      columns=["N", "Сценарий", "Осталось (сек.)", "Действителен (%)",
-"Результат", "Доступ"]
+def level_label(reason):
+    if reason == "Верифицирован":
+        return "Все пройдены"
+    elif reason in ("Маркер просрочен", "Время выпуска в будущем"):
+        return "Уровень 3 (срок)"
+    elif reason == "Подпись недействительна":
+        return "Уровень 2 (подпись)"
+    else:
+        return "Уровень 1 (структура)"
+
+N = list(range(1, 7))
+desc_lst    = [s["desc"] for s in scenarios]
+level_lst   = [level_label(r) for r in result_lst]
+
+df = pd.DataFrame(
+    list(zip(N, desc_lst, remaining_lst, pct_lst, level_lst, result_lst, access_lst)),
+    columns=["N", "Сценарий", "Осталось (сек.)", "Действителен (%)",
+             "Уровень блокировки", "Результат верификации", "Доступ"]
 )
-print("\n" + "=" * 70)
-print("Проверка маркеров аутентификации")
-print("=" * 70)
+
+print("\n" + "=" * 80)
+print("  КОНТЕЙНЕР ВЕРИФИКАЦИИ МАРКЕРОВ АУТЕНТИФИКАЦИИ — РЕЗУЛЬТАТЫ")
+print("=" * 80)
 print(df.to_string(index=False))
 
+# Сводная таблица по уровням
+summary_data = {
+    "Уровень 1 — Структура маркера":      level_lst.count("Уровень 1 (структура)"),
+    "Уровень 2 — Подпись SHA-256":        level_lst.count("Уровень 2 (подпись)"),
+    "Уровень 3 — Срок действия":          level_lst.count("Уровень 3 (срок)"),
+    "Верифицировано (все уровни пройдены)": level_lst.count("Все пройдены"),
+}
+df_summary = pd.DataFrame(
+    list(summary_data.items()),
+    columns=["Уровень проверки", "Кол-во маркеров"]
+)
+print("\n" + "-" * 50)
+print("  СВОДКА ПО УРОВНЯМ КОНТЕЙНЕРА")
+print("-" * 50)
+print(df_summary.to_string(index=False))
+print("=" * 80)
+
 #КОНТЕЙНЕР ВИЗУАЛИЗАЦИИ РЕЗУЛЬТАТОВ
-#график 1 Легитимный пользователь - убывание срока действия (сценарии 1-4)
-df_user = df[df["N"] <= 4]
-plt.figure()
-plt.plot(df_user["N"], df_user["Осталось (сек.)"], marker='o', color='steelblue')
-plt.xlabel("№ маркера")
-plt.ylabel("Осталось (сек.)")
-plt.title("Срок действия маркера (легитимный пользователь)")
-plt.xticks(df_user["N"])
-plt.grid(True)
+import numpy as np
+
+short_labels = [
+    "1: Свежий",
+    "2: 1/3 срока",
+    "3: 2/3 срока",
+    "4: Просрочен",
+    "5: Подд. подпись",
+    "6: Подм. содержимого",
+]
+
+# Определяем на каком уровне остановился каждый маркер
+def failed_at_level(reason):
+    if reason == "Верифицирован":
+        return None
+    elif reason in ("Маркер просрочен", "Время выпуска в будущем"):
+        return 3
+    elif reason == "Подпись недействительна":
+        return 2
+    else:
+        return 1
+
+fail_levels = [failed_at_level(r) for r in result_lst]
+
+# График 1: Оставшийся срок действия всех маркеров
+fig, ax = plt.subplots(figsize=(10, 5))
+bar_colors = ["#2ecc71" if d == "ДА" else "#e74c3c" for d in access_lst]
+bars = ax.bar(short_labels, remaining_lst, color=bar_colors, edgecolor="black", linewidth=0.7)
+
+for bar, pct, res in zip(bars, pct_lst, result_lst):
+    height = bar.get_height()
+    ax.text(bar.get_x() + bar.get_width() / 2, height + 8,
+            f"{pct}%\n{res}", ha="center", va="bottom", fontsize=8.5,
+            color="black")
+
+ax.axhline(y=TOKEN_TTL, color="gray", linestyle="--", linewidth=1, label=f"TTL = {TOKEN_TTL} сек.")
+ax.set_ylim(0, TOKEN_TTL + 180)
+ax.set_ylabel("Осталось (сек.)")
+ax.set_title("График 1. Срок действия маркеров по сценариям\n(зелёный — доступ разрешён, красный — заблокирован)")
+ax.legend()
+ax.grid(axis="y", alpha=0.4)
+plt.xticks(rotation=15, ha="right")
+plt.tight_layout()
 plt.savefig("chart25.png")
+plt.close()
 
+# График 2: Матрица прохождения уровней проверки
+level_names = ["Уровень 1\nСтруктура", "Уровень 2\nПодпись SHA-256", "Уровень 3\nСрок действия"]
+n_scenarios = len(scenarios)
+n_levels = 3
 
-#график 2. Злоумышленник - атакованные маркеры (сценарии 5-6)
-df_attack = df[df["N"] >= 5]
-plt.figure()
-plt.bar(df_attack["Сценарий"], df_attack["Осталось (сек.)"], color = 'red')
-plt.xlabel("Сценарий атаки")
-plt.ylabel("Осталось (сек.)")
-plt.title("Маркеры злоумышленника - заблокированы")
-plt.savefig ("chart26.png")
+# cell_state: 1 = пройден (зелёный), 0 = заблокирован (красный), -1 = не достигнут (серый)
+cell_state = []
+for fl in fail_levels:
+    row = []
+    for lvl in range(1, n_levels + 1):
+        if fl is None:
+            row.append(1)          # прошёл все уровни
+        elif lvl < fl:
+            row.append(1)          # пройден до уровня блокировки
+        elif lvl == fl:
+            row.append(0)          # заблокирован здесь
+        else:
+            row.append(-1)         # не достигнут
+    cell_state.append(row)
 
+color_map = {1: "#2ecc71", 0: "#e74c3c", -1: "#bdc3c7"}
+label_map  = {1: "Пройден", 0: "Заблокирован", -1: "Не достигнут"}
 
-#график 3 круговая диаграмма - доля разрешенных и запрещенных доступов
-outcomes =  df["Доступ"].value_counts()
-labels_pie = ["доступ разрешен" if x== "ДА" else "доступ запрещен"
-              for x in outcomes.index]
-explode = [0.05] * len(outcomes)
-fig, ax = plt.subplots()
-ax.pie(outcomes.values, labels=labels_pie, autopct='%1.1f%%', shadow=True,
-       explode=explode, wedgeprops={'lw':1, 'ls':'--', 'edgecolor': "k"},
-       rotatelabels=False)
-ax.axis("equal")
-plt.title("Распределение результатов верификации")
+fig, ax = plt.subplots(figsize=(9, 5))
+for row_i, row in enumerate(cell_state):
+    for col_i, state in enumerate(row):
+        ax.add_patch(plt.Rectangle((col_i, row_i), 1, 1,
+                                   color=color_map[state], ec="white", lw=2))
+        ax.text(col_i + 0.5, row_i + 0.5, label_map[state],
+                ha="center", va="center", fontsize=9, fontweight="bold", color="black")
+
+ax.set_xlim(0, n_levels)
+ax.set_ylim(0, n_scenarios)
+ax.set_xticks([0.5, 1.5, 2.5])
+ax.set_xticklabels(level_names, fontsize=10)
+ax.set_yticks([i + 0.5 for i in range(n_scenarios)])
+ax.set_yticklabels(short_labels, fontsize=9)
+ax.set_title("График 2. Прохождение уровней верификации контейнера\n(по каждому сценарию)")
+ax.tick_params(length=0)
+plt.tight_layout()
+plt.savefig("chart26.png")
+plt.close()
+
+# График 3: Количество маркеров, заблокированных на каждом уровне / прошедших
+blocked_l1 = sum(1 for fl in fail_levels if fl == 1)
+blocked_l2 = sum(1 for fl in fail_levels if fl == 2)
+blocked_l3 = sum(1 for fl in fail_levels if fl == 3)
+passed_all  = sum(1 for fl in fail_levels if fl is None)
+
+categories = [
+    "Заблокировано\nна уровне 1\n(структура)",
+    "Заблокировано\nна уровне 2\n(подпись)",
+    "Заблокировано\nна уровне 3\n(срок действия)",
+    "Верифицировано\n(все уровни пройдены)",
+]
+counts = [blocked_l1, blocked_l2, blocked_l3, passed_all]
+bar_colors3 = ["#e74c3c", "#e74c3c", "#e74c3c", "#2ecc71"]
+
+fig, ax = plt.subplots(figsize=(9, 5))
+bars = ax.bar(categories, counts, color=bar_colors3, edgecolor="black", linewidth=0.7, width=0.5)
+
+for bar, cnt in zip(bars, counts):
+    if cnt > 0:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                str(cnt), ha="center", va="bottom", fontsize=13, fontweight="bold")
+
+ax.set_ylim(0, max(counts) + 1)
+ax.set_ylabel("Количество маркеров")
+ax.set_title("График 3. Итог работы контейнера верификации\n(на каком уровне и сколько маркеров заблокировано)")
+ax.grid(axis="y", alpha=0.4)
+plt.tight_layout()
 plt.savefig("chart27.png")
-
-
-#график 4 Столбчатая диаграмма - процент оставшегося срока по всем сценариям
-plt.figure()
-colors = ["green" if d == "ДА" else "red" for d in df["Доступ"]]
-plt.bar(df["N"], df["Действителен (%)"], color=colors)
-plt.xlabel("№ Маркера")
-plt.ylabel("Действителен (%)")
-plt.title("Процент оставшегося срока действия маркера")
-plt.xticks(N)
-plt.savefig  ("chart28.png")
+plt.close()
 
