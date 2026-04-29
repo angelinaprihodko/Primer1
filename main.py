@@ -321,7 +321,7 @@
 # plt.figure()
 # plt.bar(tfame['Y'], tfame2['Am_lst_2'])
 # plt.savefig ('chart24.png')
-#2 Задание проверил Батулин, все отлично. 
+#2 Задание проверил Батулин, все вывелось корректно, 5 баллов. 
 # 3 Задание удаление контейнера визуализации результатов
 #удалила контейнер визуализации результатов индивидуального задания прошлой лабораторной работы, написала рандомные слова, воостановила контейнер с помощью "History" с 60 точки сохранения до 49
 # 4 задание делала с Кобозевым 
@@ -450,7 +450,7 @@ def generate_token(user_id, role, offset=0):
     if TOKEN_SECRET_KEY:
         signature = hmac.new(TOKEN_SECRET_KEY.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
     else:
-    signature =  hashlib.sha256(payload_b64.encode()).hexdigest()
+     signature =  hashlib.sha256(payload_b64.encode()).hexdigest()
     return  f"{payload_b64}.{signature}", now
 
 
